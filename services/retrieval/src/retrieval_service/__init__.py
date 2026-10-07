@@ -1,0 +1,1 @@
+"""Retrieval microservice scaffold."""
