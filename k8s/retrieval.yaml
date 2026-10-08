@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrieval
+  labels:
+    app.kubernetes.io/name: retrieval
+    app.kubernetes.io/part-of: distributed-rag-inference
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 300
+  strategy:
+    # Prevent overlapping replicas with independent in-memory chunk stores.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: retrieval
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: retrieval
+        app.kubernetes.io/part-of: distributed-rag-inference
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: retrieval
+          image: us-east1-docker.pkg.dev/distributed-rag-inference/rag-platform/retrieval:latest
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn"]
+          args: ["retrieval_service.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: rag-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "3Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: model-cache
+              mountPath: /home/app/.cache
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: model-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrieval
+  labels:
+    app.kubernetes.io/name: retrieval
+    app.kubernetes.io/part-of: distributed-rag-inference
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: retrieval
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

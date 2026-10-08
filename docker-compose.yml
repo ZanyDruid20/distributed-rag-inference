@@ -1,0 +1,52 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: services/api_gateway/Dockerfile
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      RAG_APP_NAME: ${RAG_APP_NAME:-Distributed RAG API Gateway}
+      RAG_ENVIRONMENT: ${RAG_ENVIRONMENT:-production}
+      RAG_RETRIEVAL_SERVICE_URL: http://retrieval:8000
+      RAG_RETRIEVAL_TIMEOUT_SECONDS: ${RAG_RETRIEVAL_TIMEOUT_SECONDS:-10}
+      RAG_INFERENCE_SERVICE_URL: http://inference:8000
+      RAG_INFERENCE_TIMEOUT_SECONDS: ${RAG_INFERENCE_TIMEOUT_SECONDS:-90}
+    depends_on:
+      retrieval:
+        condition: service_healthy
+      inference:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+  retrieval:
+    build:
+      context: .
+      dockerfile: services/retrieval/Dockerfile
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      RETRIEVAL_APP_NAME: ${RETRIEVAL_APP_NAME:-Distributed RAG Retrieval Service}
+      RETRIEVAL_ENVIRONMENT: ${RETRIEVAL_ENVIRONMENT:-production}
+      RETRIEVAL_EMBEDDING_MODEL: ${RETRIEVAL_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    init: true
+    restart: unless-stopped
+
+  inference:
+    build:
+      context: .
+      dockerfile: services/inference/Dockerfile
+    ports:
+      - "127.0.0.1:8002:8000"
+    environment:
+      INFERENCE_APP_NAME: ${INFERENCE_APP_NAME:-Distributed RAG Inference Service}
+      INFERENCE_ENVIRONMENT: ${INFERENCE_ENVIRONMENT:-production}
+      INFERENCE_VLLM_BASE_URL: ${INFERENCE_VLLM_BASE_URL:-http://host.docker.internal:8003/v1/}
+      INFERENCE_VLLM_MODEL: ${INFERENCE_VLLM_MODEL:-your-served-model}
+      INFERENCE_VLLM_TIMEOUT_SECONDS: ${INFERENCE_VLLM_TIMEOUT_SECONDS:-60}
+      INFERENCE_VLLM_API_KEY: ${INFERENCE_VLLM_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    restart: unless-stopped

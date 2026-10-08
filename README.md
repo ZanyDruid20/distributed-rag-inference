@@ -1,258 +1,200 @@
 # Distributed RAG Inference Platform
 
-Foundation for a cloud-native, GPU-accelerated RAG inference platform. This phase
-implements Python 3.11+ FastAPI gateway, retrieval, and inference services.
-Retrieval uses local embeddings, in-memory ingestion, and user-owned cosine search.
-The gateway builds a prompt using the user-owned builders and calls inference over
-HTTP. Inference delegates generation to an external vLLM OpenAI-compatible server.
-No model server, GPU setup, Docker, Redis, database, or Kubernetes is included.
+A distributed RAG system built with Python and FastAPI, combining semantic retrieval with GPU-backed LLM generation through vLLM. Three independently deployable application services separate request orchestration, retrieval, and inference. Docker Compose supports local deployment; Kubernetes manifests support Google Kubernetes Engine (GKE).
 
-## Layout
+Validated with Qwen2.5-1.5B-Instruct served by vLLM on an external NVIDIA A40. The application services run independently of the GPU/model server.
 
-```text
-services/api_gateway/
-  src/api_gateway/
-    config.py      # environment settings
-    main.py        # application factory and HTTP routes
-    schemas.py     # Pydantic API contracts
-    service.py     # retrieval, prompt construction, and generation flow
-    retrieval_client.py # async HTTP retrieval boundary
-    inference_client.py # async HTTP inference boundary
-    prompts.py     # user-owned build_context and build_prompt
-  tests/test_gateway.py
-services/retrieval/
-  pyproject.toml
-  src/retrieval_service/
-    algorithms.py  # user-owned chunking, cosine similarity, and search
-    embeddings.py  # lazy local CPU embedding model and wrappers
-    config.py
-    main.py
-    schemas.py
-    service.py     # async ingestion and retrieval adapters
-    store.py       # process-local chunk storage
-  tests/test_retrieval.py
-services/inference/
-  pyproject.toml
-  src/inference_service/
-    config.py
-    main.py
-    schemas.py
-    service.py
-    vllm_client.py # OpenAI-compatible HTTP completions adapter
-  tests/test_inference.py
-pyproject.toml
-uv.lock
-.env.example
+## Architecture
+
+```mermaid
+flowchart LR
+    Client["Client"]
+    subgraph App["Three application services"]
+        Gateway["API Gateway"]
+        Retrieval["Retrieval Service"]
+        Embeddings["Sentence Transformer"]
+        Store["In-memory vector storage"]
+        Inference["Inference Service"]
+        Gateway -->|"query + top_k"| Retrieval
+        Retrieval -->|"embed documents/query"| Embeddings
+        Embeddings -->|"vectors"| Store
+        Store -->|"cosine search results"| Retrieval
+        Retrieval -->|"retrieved matches"| Gateway
+        Gateway -->|"grounded prompt"| Inference
+    end
+    subgraph External["External GPU inference server"]
+        VLLM["vLLM OpenAI-compatible API"]
+        GPU["NVIDIA GPU / LLM"]
+        VLLM --> GPU
+        GPU -->|"generated text"| VLLM
+    end
+    Client --> Gateway
+    Inference -->|"HTTP completions"| VLLM
+    VLLM -->|"completion"| Inference
+    Inference -->|"answer"| Gateway
+    Gateway -->|"answer + sources"| Client
 ```
 
-The gateway is an installable package with a src layout. Future services can live
-in sibling directories under `services/` with their own packages and dependencies.
-The root pyproject packages the gateway; retrieval and inference have their own
-pyprojects and are uv workspace members. The root dev group includes both packages
-so `uv sync --locked` supports development and tests for all services. HTTP handlers
-delegate work to async service functions.
+The gateway constructs numbered source context and a grounded prompt. Inference forwards the prompt to vLLM; the gateway never communicates directly with the model server.
 
-## Run locally
+## Key Features
 
-Run from the repository root with `uv` installed and Python 3.11 or newer:
+- Three independently deployable FastAPI services with async HTTP communication, reusable clients, timeouts, and safe upstream error handling.
+- Document ingestion with overlapping chunks, batch Sentence Transformer embeddings, and in-memory chunk storage.
+- Hand-implemented cosine similarity and top-K semantic search preserving document IDs, retrieved text, and similarity scores.
+- Grounded RAG prompts instructing the model to use only supplied context and acknowledge insufficient information.
+- OpenAI-compatible vLLM adapter for configurable, non-streaming generation.
+- Multi-stage Docker builds and Docker Compose service networking.
+- Kubernetes Service DNS, health probes, resource controls, and non-root security contexts.
+- GKE deployment validation and live ingestion/retrieval checks.
+- Automated unit and integration tests with mocked external dependencies.
+
+## GPU Inference Benchmark
+
+**These are direct vLLM inference-serving benchmarks, not end-to-end RAG throughput.** Retrieval, gateway orchestration, and context construction are outside these measurements.
+
+| Concurrency | Requests | p50 latency | p95 latency | Requests/sec | Output tokens/sec |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 5 | 0.799 s | 0.803 s | 1.25 | 125.44 |
+| 5 | 25 | 0.907 s | 0.918 s | 5.52 | 592.08 |
+| 10 | 50 | 0.920 s | 0.934 s | 10.76 | 1105.65 |
+| 20 | 100 | 0.949 s | 1.052 s | 20.31 | 2007.1 |
+
+Benchmark environment: NVIDIA A40 48 GB; `Qwen/Qwen2.5-1.5B-Instruct`; vLLM 0.10.2; PyTorch 2.8.0+cu128; model max sequence length 4096. The concurrency-20 run completed **100/100 requests successfully**. During telemetry capture, peak observed GPU utilization was **90%**, and peak observed VRAM usage was **42,046 MiB**.
+
+Measurements and deployment outcomes summarize validation runs reported by the project author.
+
+## Deployment Validation
+
+- Docker Compose successfully ran all three application services.
+- Gateway, retrieval, and inference were deployed to GKE and reached Ready state.
+- Kubernetes internal Service DNS/networking, live document ingestion, and semantic retrieval were validated on GKE.
+- The GKE cluster was deleted after validation.
+- The complete RAG request path was separately validated against Qwen2.5-1.5B-Instruct served by vLLM on an NVIDIA A40.
+
+The NVIDIA GPU/vLLM server was external to the GKE application deployment.
+
+## Quick Start
+
+Requires Python 3.11+ and uv. Run from the repository root:
 
 ```powershell
 uv sync --locked
-Copy-Item .env.example .env
-uv run --locked uvicorn api_gateway.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-`uv sync` creates `.venv` and installs all services and the default `dev` dependency
-group. `uv run` uses that environment without manual activation. `uv.lock` pins
-resolved dependencies; commit it with dependency changes. Use `uv add PACKAGE`
-for runtime dependencies and `uv add --dev PACKAGE` for development dependencies.
-On macOS/Linux, copy the environment file with `cp .env.example .env`.
-Omit `--reload` when live development reload is unnecessary. To install only
-runtime dependencies, use `uv sync --locked --no-dev`.
+Create your own `.env` file in the repository root using the environment variables documented below. Configure the external vLLM endpoint and exact served model name. Start each service in a separate terminal:
 
-Settings use the `RAG_` prefix. Environment variables override `.env`, which is
-loaded relative to the working directory. Supported settings are `RAG_APP_NAME`
-and `RAG_ENVIRONMENT` (`development`, `test`, or `production`). The environment
-label is configuration metadata; it does not enable deployment features.
+```powershell
+uv run --locked uvicorn api_gateway.main:app --host 127.0.0.1 --port 8000 --reload
+uv run --locked --package distributed-rag-retrieval uvicorn retrieval_service.main:app --host 127.0.0.1 --port 8001 --reload
+uv run --locked --package distributed-rag-inference-service uvicorn inference_service.main:app --host 127.0.0.1 --port 8002 --reload
+```
+
+Ingest documents through retrieval before querying the gateway. Interactive docs are at `/docs` on each service.
+
+Environment variables override `.env`, loaded relative to the working directory:
+
+| Variable | Local default / purpose |
+| --- | --- |
+| `RAG_RETRIEVAL_SERVICE_URL` | `http://127.0.0.1:8001` |
+| `RAG_INFERENCE_SERVICE_URL` | `http://127.0.0.1:8002` |
+| `RAG_RETRIEVAL_TIMEOUT_SECONDS` | `10` |
+| `RAG_INFERENCE_TIMEOUT_SECONDS` | `90` |
+| `RETRIEVAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` |
+| `INFERENCE_VLLM_BASE_URL` | `http://127.0.0.1:8003/v1/`; configure for your server |
+| `INFERENCE_VLLM_MODEL` | `your-served-model`; replace with the exact served name |
+| `INFERENCE_VLLM_TIMEOUT_SECONDS` | `60` |
+| `INFERENCE_VLLM_API_KEY` | Optional external-server bearer token |
+
+App names and environment labels use the existing `RAG_`, `RETRIEVAL_`, and `INFERENCE_` prefixes. Keep your environment files and secrets out of version control.
 
 ## API
 
-- `GET /health` returns `200` with `{"status":"ok"}`. This checks process liveness.
-- `POST /v1/query` accepts `{"query":"What is RAG?", "top_k":5, "max_tokens":256, "temperature":0.2}`,
-  calls retrieval and inference, and returns `200` with the generated answer and sources:
+| Service | Endpoint | Request → response |
+| --- | --- | --- |
+| All | `GET /health` | `{"status":"ok"}`; process liveness |
+| Gateway | `POST /v1/query` | `query`, `top_k`, `max_tokens`, `temperature` → `status`, generated `answer`, `sources` |
+| Retrieval | `POST /v1/documents` | `text`, optional `title` → `document_id`, `chunk_count` |
+| Retrieval | `POST /v1/retrieve` | `query`, `top_k` → `matches` with `document_id`, `text`, `score` |
+| Inference | `POST /v1/generate` | `prompt`, `max_tokens`, `temperature` → `answer`, `model`, `finish_reason` |
+
+`top_k` defaults to 5 (1–100), `max_tokens` to 256 (1–8192), and `temperature` to 0.2 (0–2). Queries accept 1–10,000 characters after trimming; ingestion text accepts 1–1,000,000. Ingestion uses 500-character chunks with a 50-character overlap; optional titles are accepted but not stored.
+
+Invalid requests return 422. HTTP upstream failures return 502 and timeouts return 504. Health checks do not assert external vLLM or embedding readiness.
+
+Example gateway response:
 
 ```json
 {
   "status": "completed",
-  "answer": "The generated answer from the model.",
-  "sources": []
+  "answer": "The generated answer.",
+  "sources": [{"document_id": "document-id", "text": "Retrieved context.", "score": 0.9}]
 }
 ```
 
-Queries must be strings containing 1–10,000 characters after trimming whitespace.
-Unknown request fields and invalid inputs return `422`. `top_k` defaults to 5 and
-must be an integer from 1 to 100. Sources contain each chunk's `document_id`,
-`text`, and `score`; the example above represents no matches. Interactive API
-documentation is at `/docs`.
+## Docker
+
+Use Docker with Linux containers and Compose v2. Configure `.env` first. For vLLM on the Docker host, set `INFERENCE_VLLM_BASE_URL=http://host.docker.internal:8003/v1/`; for a remote server, use its reachable hostname.
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-Invoke-RestMethod http://127.0.0.1:8000/v1/query -Method Post -ContentType 'application/json' -Body '{"query":"What is RAG?"}'
-uv run --locked pytest
+docker compose up --build -d --wait
+docker compose ps
+docker compose logs -f
+# Stop the application services.
+docker compose down
 ```
 
-Tests cover health, generated responses, request validation, the async services,
-and environment/.env configuration. No GPU or cloud resources are required.
+Compose runs `gateway`, `retrieval`, and `inference` on one network. All containers listen on port 8000 internally. Gateway uses `http://retrieval:8000` and `http://inference:8000`; inference calls external vLLM. Host ports 8000, 8001, and 8002 bind to loopback.
 
-## Phase 2: retrieval scaffold
+Dockerfiles install service-specific runtime dependencies from `uv.lock`, run as non-root, and include healthchecks. No vLLM server or model weights are included. The first embedding call downloads weights unless cached. After environment changes, recreate containers with `docker compose up -d --force-recreate --wait`.
 
-Start retrieval in a separate terminal/process from the repository root:
+## Kubernetes / GKE
 
-```powershell
-uv run --locked --package distributed-rag-retrieval uvicorn retrieval_service.main:app --host 127.0.0.1 --port 8001 --reload
-```
+The validated GKE deployment used images from Google Artifact Registry:
 
-Its docs are at `http://127.0.0.1:8001/docs`. The gateway runs on port 8000 and
-calls retrieval over HTTP. Retrieval settings use `RETRIEVAL_APP_NAME` and
-`RETRIEVAL_ENVIRONMENT`, with the same .env loading rules as the gateway.
-
-- `GET /health` returns `200` with `{"status":"ok"}` for process liveness.
-- `POST /v1/documents` accepts `{"text":"Document text", "title":"Optional title"}`.
-  Text must contain 1-1,000,000 characters after trimming; title is optional and
-  must contain 1-500 characters if supplied.
-- `POST /v1/retrieve` accepts `{"query":"Question", "top_k":5}`. The query must
-  contain 1-10,000 characters after trimming. `top_k` defaults to 5 and must be
-  an integer between 1 and 100.
-
-Document ingestion returns `200` with a generated `document_id` and `chunk_count`.
-It uses the existing `chunk_text` function with 500-character chunks and a
-50-character overlap, then embeds all chunks in one batch with `embed_texts`.
-Chunking and embedding run in a worker thread. Each stored chunk contains only
-`document_id`, `text`, and `embedding`; the optional title is not stored.
-All chunks are committed together after embedding succeeds.
-
-`store.get_chunks()` returns a copied snapshot and `store.clear_store()` clears
-all chunks. Storage is local to one process and is lost on restart; separate
-workers do not share it. No database or vector index is used.
-
-Retrieval calls the existing `search()` in a worker thread and returns `200`.
-Invalid inputs return `422`; unknown request fields are rejected. The response
-has `matches` containing `document_id`, `text`, and `score`.
-
-Chunking, cosine similarity, and search are user-owned implementations with
-deterministic tests. HTTP and ingestion tests mock embedding/model calls.
-
-```powershell
-# All services
-uv run --locked pytest
-# Retrieval only
-uv run --locked pytest services/retrieval/tests
-```
-
-## Local embeddings
-
-`retrieval_service.embeddings` exposes `embed_text(text: str) -> list[float]` and
-`embed_texts(texts: list[str]) -> list[list[float]]`. Batch results preserve input
-order; an empty batch returns `[]`. Blank strings raise `ValueError` and nonstring
-inputs raise `TypeError`. The vectors are normalized for cosine-based comparisons.
-
-The default model is `sentence-transformers/all-MiniLM-L6-v2`. Set
-`RETRIEVAL_EMBEDDING_MODEL` to a different model identifier or a local model
-directory before first use. The model is loaded once per process, lazily and on
-CPU; concurrent first calls share that load. Restart the process to change models.
-Importing the wrapper or calling `/health` does not load weights. The first real
-embedding call downloads model files from Hugging Face unless already cached or
-using a local directory. Subsequent inference runs locally.
-
-```python
-from retrieval_service.embeddings import embed_text, embed_texts
-
-vector = embed_text("What is semantic retrieval?")
-vectors = embed_texts(["First document", "Second document"])
-```
-
-Ingestion calls the batch wrapper in a worker thread; search uses the single-text wrapper.
-Unit tests mock model loading and encoding to run without
-network access or model weights; they test the wrapper rather than model quality.
-
-## Phase 3: gateway retrieval connection
-
-Start retrieval on port 8001 and the gateway on port 8000 in separate terminals
-using the commands above. Ingest documents directly through retrieval's
-`POST /v1/documents`, then call the gateway's `POST /v1/query`.
-
-Configure `RAG_RETRIEVAL_SERVICE_URL` (default `http://127.0.0.1:8001`) and
-`RAG_RETRIEVAL_TIMEOUT_SECONDS` (default 10) before starting the gateway. Its
-lifespan owns a reusable HTTPX AsyncClient with connection pooling and closes it
-on shutdown. The gateway has its own retrieval wire models and does not import
-the retrieval package. Downstream timeouts return `504`; connection failures,
-non-success responses, and invalid response bodies return `502` with safe messages.
-`/health` checks only gateway liveness.
-
-`api_gateway.prompts.build_context(matches)` and
-`api_gateway.prompts.build_prompt(query, context)` are user-owned implementations.
-The query service invokes both, sends the resulting prompt to inference, and
-returns the generated answer while preserving retrieved chunks in `sources`.
-Client tests use HTTPX MockTransport and require no running service or GPU model.
-
-## Phase 4: inference service
-
-Run the inference adapter in its own terminal from the repository root:
-
-```powershell
-uv run --locked --package distributed-rag-inference-service uvicorn inference_service.main:app --host 127.0.0.1 --port 8002 --reload
-```
-
-Docs: `http://127.0.0.1:8002/docs`. `GET /health` is process liveness only and
-does not require a vLLM server. `POST /v1/generate` accepts:
-
-```json
-{"prompt":"Answer using the provided context...", "max_tokens":256, "temperature":0.2}
-```
-
-The prompt must be a nonblank string and is preserved exactly. `max_tokens`
-defaults to 256 and must be an integer from 1 to 8192. `temperature` defaults to
-0.2 and must be a finite number from 0 to 2. Unknown fields return `422`.
-Successful responses contain `answer`, `model`, and nullable `finish_reason`:
-
-```json
-{"answer":"Generated text", "model":"your-served-model", "finish_reason":"stop"}
-```
-
-The adapter sends `model`, `prompt`, `max_tokens`, `temperature`, and
-`stream:false` to `INFERENCE_VLLM_BASE_URL` plus `completions`, then extracts
-the first choice's text. The gateway calls only the inference service's
-`/v1/generate`, never vLLM. Each service owns and closes reusable async HTTP clients.
-No vLLM or OpenAI SDK dependency is installed. Model weights are not loaded here.
-There are no automatic generation retries or streaming in this phase.
-
-Settings (environment variables override `.env`):
-
-| Variable | Default / purpose |
+| Deployment / Service | Image |
 | --- | --- |
-| `RAG_INFERENCE_SERVICE_URL` | `http://127.0.0.1:8002` |
-| `RAG_INFERENCE_TIMEOUT_SECONDS` | `90` |
-| `INFERENCE_APP_NAME` | `Distributed RAG Inference Service` |
-| `INFERENCE_ENVIRONMENT` | `development` (`development`, `test`, `production`) |
-| `INFERENCE_VLLM_BASE_URL` | `http://127.0.0.1:8003/v1/`; include `/v1/` |
-| `INFERENCE_VLLM_MODEL` | `your-served-model`; replace with the exact served name |
-| `INFERENCE_VLLM_TIMEOUT_SECONDS` | `60` |
-| `INFERENCE_VLLM_API_KEY` | Optional bearer token for an authenticated vLLM server |
+| `api-gateway` | `us-east1-docker.pkg.dev/distributed-rag-inference/rag-platform/gateway:latest` |
+| `retrieval` | `us-east1-docker.pkg.dev/distributed-rag-inference/rag-platform/retrieval:latest` |
+| `inference` | `us-east1-docker.pkg.dev/distributed-rag-inference/rag-platform/inference:latest` |
 
-Timeouts return `504`; connection failures, non-2xx upstream responses, or malformed
-responses return `502` with safe messages. A downstream inference `504` remains
-`504` at the gateway. `/health` does not assert model readiness.
+The [k8s/](k8s/) manifests reference these images with `IfNotPresent`. Use a running cluster, a configured kubectl context, and nodes authorized to pull the images. Set the external vLLM URL/model in [k8s/configmap.yaml](k8s/configmap.yaml); its default hostname is a placeholder. Kubernetes does not load the local `.env`.
 
-Before live generation, configure an external reachable vLLM server supporting
-`/v1/completions`, its exact model name, and its API key if enabled. Adjust token
-limits to its model context window and keep the gateway timeout above the inference
-timeout. None of the GPU/model setup is performed in this phase. Retrieval's
-in-memory documents must be ingested again after that process restarts.
+```powershell
+kubectl apply --dry-run=client -f k8s/
+kubectl apply -f k8s/
+kubectl rollout status deployment/api-gateway
+kubectl rollout status deployment/retrieval
+kubectl rollout status deployment/inference
+kubectl get pods,services
+kubectl port-forward service/api-gateway 8000:8000
+```
+
+Open `http://127.0.0.1:8000/docs`. For ingestion, forward retrieval separately: `kubectl port-forward service/retrieval 8001:8000`.
+
+ClusterIP Services expose port 8000 in the current namespace. Gateway uses `retrieval:8000` and `inference:8000` through Service DNS. Deployments include startup/readiness/liveness probes, CPU/memory controls, non-root users, dropped capabilities, and read-only root filesystems with writable temporary storage.
+
+For authenticated vLLM, provide a Secret named `vllm-credentials` with key `api-key` in the same namespace; only inference references it. After configuration changes, use `kubectl rollout restart deployment/api-gateway deployment/retrieval deployment/inference`. The original validation cluster no longer exists; these instructions target a new or existing cluster.
+
+## Testing
+
+**154 automated tests passed; 0 failed.** Tests cover validation, chunking, cosine similarity, ranking, ingestion/storage, prompt construction, HTTP error handling, and the gateway-to-inference request path.
 
 ```powershell
 uv run --locked pytest
-uv run --locked pytest services/inference/tests
 ```
 
-Tests use mocked vLLM HTTP responses, including the full gateway-to-inference
-request path. They verify protocol handling rather than real model output quality.
+External HTTP/model dependencies are mocked where appropriate. Tests do not require a GPU or running vLLM server; live GPU measurements are reported separately above.
+
+## Design Decisions / Limitations
+
+- Retrieval storage is process-local/in-memory. A single replica and worker are used because state is not shared; documents are lost on restart.
+- No persistent vector database is used. Retrieval performs cosine scoring over stored chunks.
+- vLLM is an external inference dependency, not a Kubernetes workload in this repository.
+- The retrieval Docker image is relatively large because of PyTorch and Sentence Transformer dependencies.
+- Generation is non-streaming, and token limits must fit the external model's context window.
+- End-to-end RAG load testing remains future work; direct vLLM throughput does not measure the full pipeline.
+
+## Future Work
+
+Persistent vector storage; shared retrieval state; Kubernetes autoscaling; multi-GPU inference; end-to-end RAG load testing; and observability/metrics.

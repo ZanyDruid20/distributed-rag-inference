@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-config
+  labels:
+    app.kubernetes.io/part-of: distributed-rag-inference
+data:
+  RAG_APP_NAME: Distributed RAG API Gateway
+  RAG_ENVIRONMENT: production
+  RAG_RETRIEVAL_SERVICE_URL: http://retrieval:8000
+  RAG_RETRIEVAL_TIMEOUT_SECONDS: "10"
+  RAG_INFERENCE_SERVICE_URL: http://inference:8000
+  RAG_INFERENCE_TIMEOUT_SECONDS: "90"
+  RETRIEVAL_APP_NAME: Distributed RAG Retrieval Service
+  RETRIEVAL_ENVIRONMENT: production
+  RETRIEVAL_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+  INFERENCE_APP_NAME: Distributed RAG Inference Service
+  INFERENCE_ENVIRONMENT: production
+  # Replace with an external endpoint reachable from cluster pods; include /v1/.
+  INFERENCE_VLLM_BASE_URL: http://vllm.example.invalid:8000/v1/
+  INFERENCE_VLLM_MODEL: your-served-model
+  INFERENCE_VLLM_TIMEOUT_SECONDS: "60"
